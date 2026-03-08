@@ -45,6 +45,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <limits.h>
+#include <ctype.h>
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -489,8 +490,33 @@ static void rotate_cmp(const char *a, const char *b, char *out, int cap) {
     }
 }
 
-/* magic_split: auto-detect separator for any corpus format */
+/* ================================================================
+ * FORMAT DETECTION + magic_split
+ *
+ * Detects FASTA, DNA/RNA, and normal text automatically.
+ * For FASTA/DNA: returns '\0' (sentinel) to trigger kmer mode.
+ * For normal text: returns the best separator character.
+ * ================================================================ */
+static int is_fasta(const char *text, int n) {
+    for (int i = 0; i < n && i < 8; i++)
+        if (text[i] == '>') return 1;
+    return 0;
+}
+static int is_dna_like(const char *text, int n) {
+    /* >85% ACGTNU bases (ignoring whitespace and > header chars) */
+    int dna = 0, other = 0;
+    for (int i = 0; i < n && i < 8192; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == ' ' || c == '\n' || c == '\t' || c == '\r' || c == '>') continue;
+        if (c=='A'||c=='T'||c=='C'||c=='G'||c=='N'||c=='U'||
+            c=='a'||c=='t'||c=='c'||c=='g'||c=='n'||c=='u') dna++;
+        else other++;
+    }
+    return (dna > 8) && ((other * 6) < dna);
+}
+/* Returns '\0' for DNA/FASTA (use kmer mode), else best separator char */
 static char magic_split(const char *text, int n) {
+    if (is_fasta(text, n) || is_dna_like(text, n)) return '\0';
     static const char pref[] = " \n\t,.:;|-/\\@#";
     for (int i = 0; pref[i]; i++) {
         int cnt = 0;
@@ -534,6 +560,8 @@ typedef struct {
     int     n_merges;
     char    splitter;
     int     vocab_target, min_freq;
+    int     kmer_mode;   /* 1 if DNA/FASTA: use kmer splitting */
+    int     kmer_k;      /* kmer length (default 6) */
     double  t_ent_start, t_ent_end, t_train_s;
 } Tok;
 
@@ -545,11 +573,13 @@ static void tok_build_dafsa(Tok *tok) {
     for (int i = 0; i < n; i++) { strs[i] = tok->vocab->str[i].s; ids[i] = i; }
     tok->dafsa = build_dafsa(strs, ids, n, n*8 + 64);
     free(strs); free(ids);
-    sep_init(tok->splitter);
+    /* kmer mode: use space as logical separator (kmers already split) */
+    sep_init(tok->kmer_mode ? ' ' : tok->splitter);
 }
 static Tok *tok_new(int vs, int mf) {
     Tok *t = calloc(1, sizeof(Tok));
     t->vocab = vocab_new(); t->vocab_target = vs; t->min_freq = mf;
+    t->kmer_k = 6; /* default kmer length for DNA mode */
     const char *spec[] = {"<pad>","<unk>","<bos>","<eos>","</w>"};
     for (int i = 0; i < 5; i++) vocab_add(t->vocab, spec[i]);
     return t;
@@ -558,26 +588,67 @@ static Tok *tok_new(int vs, int mf) {
 /* ================================================================
  * TRAINING
  * ================================================================ */
+static char *extract_dna_seq(const char *text, int tlen, int *out_len) {
+    char *seq = malloc(tlen + 1); int n = 0;
+    const char *p = text, *end = text + tlen;
+    while (p < end) {
+        while (p < end && *p == '\r') p++;
+        if (p >= end) break;
+        if (*p == '>') { while (p < end && *p != '\n') p++; if (p<end) p++; continue; }
+        while (p < end && *p != '\n') {
+            char c = *p++;
+            if (c!=' '&&c!='\t'&&c!='\r') seq[n++]=(char)toupper((unsigned char)c);
+        }
+        if (p < end) p++;
+    }
+    seq[n]=0; *out_len=n; return seq;
+}
+
 static WPool *build_pool(Tok *tok, const char *text, int tlen) {
     WPool *wp = wp_new();
     int eow = vocab_find(tok->vocab, "</w>");
-    const char *p = text, *end = text + tlen;
-    while (p < end) {
-        const char *we;
-        const char *ws = next_word(p, end, &we);
-        if (ws >= end) break;
-        int wl = (int)(we - ws); p = we;
-        if (!wl || wl >= MAX_TOK_LEN) continue;
-        char word[MAX_TOK_LEN]; memcpy(word, ws, wl); word[wl] = 0;
-        WEntry *e = wp_get(wp, word);
-        if (e->n_toks == 0) {
-            int ci = 0;
-            for (int i = 0; i < wl && ci < MAX_TOKS_WORD-1; i++) {
-                char bs[2] = {(char)ws[i], 0};
-                e->toks[ci++] = vocab_add(tok->vocab, bs);
-            }
-            e->toks[ci++] = eow; e->n_toks = (uint16_t)ci;
-        } else e->freq++;
+
+    if (tok->kmer_mode) {
+        /* DNA/FASTA: strip headers, join sequence, split into non-overlapping k-mers.
+         * Non-overlapping k-mers of length k give O(seq_len/k) unique words.
+         * BPE then merges frequent kmer pairs -> codons, motifs, repeat units. */
+        int slen = 0;
+        char *seq = extract_dna_seq(text, tlen, &slen);
+        int k = tok->kmer_k;
+        for (int i = 0; i + k <= slen; i += k) {
+            char kmer[MAX_TOK_LEN];
+            memcpy(kmer, seq+i, k); kmer[k]=0;
+            WEntry *e = wp_get(wp, kmer);
+            if (e->n_toks == 0) {
+                int ci = 0;
+                for (int j=0; j<k && ci<MAX_TOKS_WORD-1; j++) {
+                    char bs[2]={kmer[j],0};
+                    e->toks[ci++] = vocab_add(tok->vocab, bs);
+                }
+                e->toks[ci++]=eow; e->n_toks=(uint16_t)ci;
+            } else e->freq++;
+        }
+        free(seq);
+    } else {
+        /* Normal text mode: split on whitespace/splitter */
+        const char *p=text, *end=text+tlen;
+        while (p < end) {
+            const char *we;
+            const char *ws = next_word(p, end, &we);
+            if (ws >= end) break;
+            int wl = (int)(we-ws); p = we;
+            if (!wl || wl >= MAX_TOK_LEN) continue;
+            char word[MAX_TOK_LEN]; memcpy(word,ws,wl); word[wl]=0;
+            WEntry *e = wp_get(wp, word);
+            if (e->n_toks == 0) {
+                int ci=0;
+                for (int i=0; i<wl && ci<MAX_TOKS_WORD-1; i++) {
+                    char bs[2]={(char)ws[i],0};
+                    e->toks[ci++]=vocab_add(tok->vocab,bs);
+                }
+                e->toks[ci++]=eow; e->n_toks=(uint16_t)ci;
+            } else e->freq++;
+        }
     }
     return wp;
 }
@@ -645,15 +716,28 @@ static double tok_entropy(const WPool *wp, int vn) {
 
 static void tok_train(Tok *tok, const char *text, int tlen, int verbose) {
     double t0 = now_s();
-    tok->splitter = magic_split(text, tlen);
     tok->n_merges = 0;
-    sep_init(tok->splitter);
-
+    {
+        char sp = magic_split(text, tlen);
+        if (!tok->kmer_mode) { /* don't override if --kmer was passed */
+            if (sp == '\0') {
+                tok->kmer_mode = 1;
+                tok->splitter  = ' ';
+            } else {
+                tok->kmer_mode = 0;
+                tok->splitter  = sp;
+            }
+        }
+        sep_init(tok->kmer_mode ? ' ' : tok->splitter);
+    }
     WPool *wp = build_pool(tok, text, tlen);
     if (verbose) {
         int total = 0;
         for (int i = 0; i < wp->n; i++) total += wp->e[i].freq;
-        printf("  Splitter  : '%c'\n", tok->splitter);
+        if (tok->kmer_mode)
+            printf("  Mode      : DNA/FASTA (k-mer k=%d)\n", tok->kmer_k);
+        else
+            printf("  Mode      : text (splitter='%c')\n", tok->splitter);
         printf("  Words     : %d total / %d unique (%.1fx dedup)\n",
                total, wp->n, (double)total/wp->n);
         printf("  Base vocab: %d chars\n", tok->vocab->n);
@@ -669,9 +753,7 @@ static void tok_train(Tok *tok, const char *text, int tlen, int verbose) {
 
     double last_ent = tok->t_ent_start; int last_check = 0;
     for (int step = 0; tok->vocab->n < tok->vocab_target && tok->n_merges < MAX_MERGES; step++) {
-        HNode best = {0, -1, -1};
-        while (heap->n) {
-            HNode top = heap->h[0];
+        HNode best = {0, -1, -1};        while (heap->n) {            HNode top = heap->h[0];
             if (top.a<0||top.a>=tok->vocab->n||top.b<0||top.b>=tok->vocab->n)
                 { heap_pop(heap); continue; }
             PSlot *sl = pm_slot(pm, top.a, top.b);
@@ -769,6 +851,74 @@ static int *tok_encode(const Tok *tok, const char *text, int *out_n) {
     const char **wstarts = malloc((size_t)wmax * sizeof(char *));
     int         *wlens   = malloc((size_t)wmax * sizeof(int));
     const char *p = text, *end = text + tlen;
+    if (tok->kmer_mode) {
+        /* DNA encode: extract sequence then split into k-mers */
+        int slen = 0;
+        char *seq = extract_dna_seq(text, (int)(end-p), &slen);
+        int k = tok->kmer_k;
+        /* build wstarts/wlens from kmer positions in seq */
+        for (int i = 0; i + k <= slen; i += k) {
+            if (nw >= wmax) {
+                wmax *= 2;
+                wstarts = realloc(wstarts, (size_t)wmax * sizeof(char *));
+                wlens   = realloc(wlens,   (size_t)wmax * sizeof(int));
+            }
+            wstarts[nw] = seq + i; wlens[nw] = k; nw++;
+        }
+        /* seq memory: we hold pointers into it, free after encode pass 2 */
+        /* store in wstarts[-1]? No: use a side buffer instead */
+        /* Simple fix: allocate kmer strings on heap, store as wstarts */
+        /* Actually seq is malloc'd -- it lives until after pass 2, OK */
+        /* BUT: seq is local to this if-block. Move alloc before presplit. */
+        /* Rebuild: store seq pointer so we can free it */
+        /* For simplicity: store kmers as copied strings */
+        free(seq); nw = 0; /* reset and redo properly */
+        int slen2 = 0;
+        char *seq2 = extract_dna_seq(text, tlen, &slen2);
+        char **kmer_strs = malloc((size_t)(slen2/k + 2) * sizeof(char*));
+        int n_kmers = 0;
+        for (int i = 0; i + k <= slen2; i += k) {
+            char *km = malloc(k + 1);
+            memcpy(km, seq2 + i, k); km[k] = 0;
+            kmer_strs[n_kmers] = km;
+            if (nw >= wmax) {
+                wmax *= 2;
+                wstarts = realloc(wstarts, (size_t)wmax * sizeof(char *));
+                wlens   = realloc(wlens,   (size_t)wmax * sizeof(int));
+            }
+            wstarts[nw] = km; wlens[nw] = k; nw++;
+            n_kmers++;
+        }
+        free(seq2);
+        /* kmer_strs and kmer_strs[i] freed after pass 2 below */
+        /* Pass 2 + 3 below use wstarts/wlens normally */
+        /* After pass 3 we free kmer strings */
+        /* We'll free them right after the parallel encode section */
+        /* Store pointer for cleanup -- use tbufs[-1] trick? No. */
+        /* Use a static global is wrong. Use a flag + local array. */
+        /* SIMPLEST: encode kmers inline here, skip pass 2/3 */
+        {
+            int unk2 = vocab_find(tok->vocab, "<unk>"); if (unk2<0) unk2=1;
+            int bos2 = vocab_find(tok->vocab, "<bos>");
+            int eos2 = vocab_find(tok->vocab, "<eos>");
+            int cap2 = nw * (k+2) + 8;
+            int *ids2 = malloc((size_t)cap2 * sizeof(int));
+            int pos2 = 0;
+            if (bos2 >= 0) ids2[pos2++] = bos2;
+            int wids2[MAX_TOKS_WORD+2];
+            for (int wi = 0; wi < nw; wi++) {
+                char word2[MAX_TOK_LEN];
+                memcpy(word2, wstarts[wi], wlens[wi]); word2[wlens[wi]] = 0;
+                int wn2 = dafsa_encode_word(tok->dafsa, word2, unk2, wids2, MAX_TOKS_WORD+2);
+                if (pos2 + wn2 >= cap2) { cap2 = (pos2+wn2)*2; ids2=realloc(ids2,(size_t)cap2*sizeof(int)); }
+                memcpy(ids2+pos2, wids2, wn2*sizeof(int)); pos2 += wn2;
+            }
+            if (eos2 >= 0) ids2[pos2++] = eos2;
+            for (int i=0;i<n_kmers;i++) free(kmer_strs[i]);
+            free(kmer_strs); free(wstarts); free(wlens);
+            *out_n = pos2; return ids2;
+        }
+    }
     while (p < end) {
         const char *we;
         const char *ws = next_word(p, end, &we);
@@ -893,8 +1043,8 @@ static void jesc(const char *s, char *o, int cap) {
 static void tok_save(const Tok *tok, const char *path) {
     FILE *f = fopen(path, "w"); if (!f) { perror(path); return; }
     char sp[2]={tok->splitter,0}, esp[16]; jesc(sp, esp, 16);
-    fprintf(f, "{\n  \"version\": 5,\n  \"vocab_size\": %d,\n  \"min_freq\": %d,\n  \"splitter\": %s,\n",
-            tok->vocab_target, tok->min_freq, esp);
+    fprintf(f, "{\n  \"version\": 5,\n  \"vocab_size\": %d,\n  \"min_freq\": %d,\n  \"splitter\": %s,\n  \"kmer_mode\": %d,\n  \"kmer_k\": %d,\n",
+            tok->vocab_target, tok->min_freq, esp, tok->kmer_mode, tok->kmer_k);
     fprintf(f, "  \"train_entropy_start\": %.6f,\n  \"train_entropy_end\": %.6f,\n  \"train_time_s\": %.3f,\n",
             tok->t_ent_start, tok->t_ent_end, tok->t_train_s);
     fprintf(f, "  \"vocab\": {\n");
@@ -973,6 +1123,19 @@ static int tok_load(Tok *tok, const char *path) {
         while (*p==' '||*p==':') p++;
         if (*p=='"') { char tmp[8]; jread_str(p,tmp,8); tok->splitter=tmp[0]; }
     } else tok->splitter = ' ';
+    const char *kmp = strstr(json, "\"kmer_mode\"");
+    if (kmp) {
+        const char *p = kmp + strlen("\"kmer_mode\"");
+        while (*p==' '||*p==':') p++;
+        tok->kmer_mode = atoi(p);
+    }
+    const char *kkp = strstr(json, "\"kmer_k\"");
+    if (kkp) {
+        const char *p = kkp + strlen("\"kmer_k\"");
+        while (*p==' '||*p==':') p++;
+        tok->kmer_k = atoi(p);
+        if (tok->kmer_k < 1 || tok->kmer_k > 32) tok->kmer_k = 6;
+    }
     free(json);
     tok_build_dafsa(tok);
     return 1;
@@ -1085,7 +1248,7 @@ static void run_bench(const char *text, int tlen) {
  * ================================================================ */
 static void usage(void) {
     puts("etok v5 -- Entropy Tokenizer (single file, zero dependencies)\n"
-         "  train  --data FILE --out FILE [--vocab N] [--minfreq N] [-v]\n"
+         "  train  --data FILE --out FILE [--vocab N] [--minfreq N] [--kmer K] [-v]\n"
          "  encode --vocab FILE --text STRING\n"
          "  decode --vocab FILE --ids 1,2,3,...\n"
          "  stats  --data FILE\n"
@@ -1098,7 +1261,7 @@ int main(int argc, char **argv) {
     const char *cmd  = argv[1];
     const char *data = NULL, *vpath = NULL, *out = "vocab.json";
     const char *targ = NULL, *iarg  = NULL, *aa  = NULL, *bb = NULL;
-    int vs = 512, mf = 2, verbose = 0;
+    int vs = 512, mf = 2, verbose = 0, kmer_k_arg = 0;
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i],"--data")     && i+1<argc) data  = argv[++i];
         else if (!strcmp(argv[i],"--vocab")    && i+1<argc) vpath = argv[++i];
@@ -1109,6 +1272,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i],"--b")        && i+1<argc) bb    = argv[++i];
         else if (!strcmp(argv[i],"--vocab_size")&& i+1<argc) vs   = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--minfreq")  && i+1<argc) mf    = atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--kmer")     && i+1<argc) kmer_k_arg = atoi(argv[++i]);
         else if (!strcmp(argv[i],"-v") || !strcmp(argv[i],"--verbose")) verbose = 1;
     }
     char *text = NULL; int tlen = 0;
@@ -1122,6 +1286,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "train")) {
         if (!data) { fputs("--data required\n", stderr); return 1; }
         Tok *tok = tok_new(vs, mf);
+        if (kmer_k_arg > 0) { tok->kmer_mode = 1; tok->kmer_k = kmer_k_arg; }
         tok_train(tok, text, tlen, verbose);
         tok_save(tok, out);
         printf("Trained %.3fs | Vocab: %d | Entropy: %.4f->%.4f | DAFSA: %d nodes | %s\n",
