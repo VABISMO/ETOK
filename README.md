@@ -226,4 +226,4 @@ Encode:
 
 ## License
 
-Apache 2 - Non Cmercial
+Apache 2 - Non Comercial
