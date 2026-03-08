@@ -40,8 +40,6 @@ etok training time is nearly **constant across vocab sizes** because entropy-ada
 | HuggingFace tokenizers¹ | ~100 MB/s | Rust |
 | **etok** | **~400–600 MB/s (8-16 core) ** | C99  |
 
-etok's encode speed is **significantly slower** than production tokenizers. The cause is the encode algorithm: etok applies each merge rule in training order — O(n × n\_merges) — while tiktoken and SentencePiece build a trie at load time for O(n) encode. A trie encoder is on the roadmap. For offline preprocessing (encode once, cache), the current speed is often acceptable.
-
 ---
 
 ## What makes etok different
