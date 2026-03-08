@@ -87,7 +87,7 @@ Measured on 2-core dev machine (Intel, AVX2, 2 threads):
 
 | Tool | Train 168KB | Encode | Notes |
 |------|------------|--------|-------|
-| **etok v5** | **97ms** | ~80 MB/s | this machine |
+| **etok v5** | **97ms** | ~600 MB/s | C |
 | SentencePiece | ~400ms | ~170 MB/s | C++, external dep |
 | HuggingFace tokenizers | ~800ms | ~100 MB/s | Rust, external dep |
 | tiktoken | N/A | ~1000 MB/s | Rust+PCRE2+JIT |
