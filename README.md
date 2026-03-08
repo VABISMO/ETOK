@@ -134,7 +134,7 @@ gcc -O3 -o etok src/etok.c -lm
 | Zero dependencies | ✓ | ✗ | ✗ | ✗ |
 | Trainable on your corpus | ✓ | ✗ | ✓ | ✓ |
 | Train speed | **fastest** | N/A | fast | fast |
-| Encode speed | slow | fastest | fast | fast |
+| Encode speed | fast | fastest | fast | slow |
 | magic\_split | ✓ | ✗ | ✗ | ✗ |
 | rotate\_compare | ✓ | ✗ | ✗ | ✗ |
 | freq×length ranking | ✓ | ✗ | ✗ | ✗ |
