@@ -1,4 +1,4 @@
-# etok — Entropy Tokenizer v5
+# etok — Entropy Tokenizer
 
 Single-file BPE tokenizer in C. Zero dependencies. Trains faster than SentencePiece.
 Supports plain text, CSV, code, and **DNA/FASTA** sequences natively.
