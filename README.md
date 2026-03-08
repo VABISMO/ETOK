@@ -38,7 +38,7 @@ etok training time is nearly **constant across vocab sizes** because entropy-ada
 | tiktoken¹ | ~1,000 MB/s | Rust + PCRE2 + precompiled trie |
 | SentencePiece¹ | ~170 MB/s | C++ trie |
 | HuggingFace tokenizers¹ | ~100 MB/s | Rust |
-| **etok** | **~70 MB/s** | C, sequential merge application |
+| **etok** | **~400–600 MB/s (8-16 core) ** | C99  |
 
 etok's encode speed is **significantly slower** than production tokenizers. The cause is the encode algorithm: etok applies each merge rule in training order — O(n × n\_merges) — while tiktoken and SentencePiece build a trie at load time for O(n) encode. A trie encoder is on the roadmap. For offline preprocessing (encode once, cache), the current speed is often acceptable.
 
@@ -134,7 +134,7 @@ gcc -O3 -o etok src/etok.c -lm
 | Zero dependencies | ✓ | ✗ | ✗ | ✗ |
 | Trainable on your corpus | ✓ | ✗ | ✓ | ✓ |
 | Train speed | **fastest** | N/A | fast | fast |
-| Encode speed | fast | fastest | fast | slow |
+| Encode speed | very fast | fastest | fast | slow |
 | magic\_split | ✓ | ✗ | ✗ | ✗ |
 | rotate\_compare | ✓ | ✗ | ✗ | ✗ |
 | freq×length ranking | ✓ | ✗ | ✗ | ✗ |
